@@ -6,14 +6,17 @@
  *
  * USAGE
  *   bun run index.ts --results ./test-output.json [options]
+ *   bun run index.ts --dir    ./results/          [options]
  *
  * OPTIONS
- *   --results    <path>   Path to the JSON file containing test results  (required)
- *   --req-id     <id>     Regulatory rule ID, e.g. "FDA-820.30g"          (optional)
- *   --build      <ver>    Build/version string, e.g. "v1.2.3"             (optional)
- *   --status     <val>    Execution status override: PASS | FAIL           (optional)
- *   --endpoint   <url>    Override the default Vercel endpoint             (optional)
- *   --env-file   <path>   Path to a .env file to load (default: ./.env)   (optional)
+ *   --results    <path>   Path to a single JSON results file               (required if no --dir)
+ *   --dir        <path>   Path to a directory of JSON results files        (required if no --results)
+ *   --concurrency <n>     Max simultaneous uploads when using --dir        (default: 4)
+ *   --req-id     <id>     Regulatory rule ID, e.g. "FDA-820.30g"           (optional)
+ *   --build      <ver>    Build/version string, e.g. "v1.2.3"              (optional)
+ *   --status     <val>    Execution status override: PASS | FAIL            (optional)
+ *   --endpoint   <url>    Override the default Vercel endpoint              (optional)
+ *   --env-file   <path>   Path to a .env file to load (default: ./.env)    (optional)
  *   --help               Show this help text and exit
  *
  * ENVIRONMENT VARIABLES
@@ -31,8 +34,8 @@
  *   • No silent failures — all network/file errors surface immediately.
  */
 
-import { readFileSync, existsSync } from "fs";
-import { resolve } from "path";
+import { readFileSync, existsSync, readdirSync, statSync } from "fs";
+import { resolve, basename } from "path";
 import chalk from "chalk";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,6 +45,7 @@ import chalk from "chalk";
 const DEFAULT_ENDPOINT = "https://omnis-ui-ecru.vercel.app/api/ingest";
 const API_KEY_PREFIX = "omn_";
 const MIN_API_KEY_LENGTH = 8;
+const DEFAULT_CONCURRENCY = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal .env loader
@@ -125,7 +129,9 @@ function loadEnvFile(filePath: string): void {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface CliArgs {
-  resultsPath: string;
+  resultsPath: string | undefined;
+  dirPath: string | undefined;
+  concurrency: number;
   reqId: string | undefined;
   buildVersion: string | undefined;
   executionStatus: string | undefined;
@@ -147,15 +153,30 @@ function parseArgs(argv: string[]): CliArgs {
   };
 
   const resultsPath = get("--results");
-  if (!resultsPath) {
+  const dirPath = get("--dir");
+
+  if (!resultsPath && !dirPath) {
     fatal(
-      "--results is required.\n" +
-        "  Example: bun run index.ts --results ./test-output.json"
+      "Either --results or --dir is required.\n" +
+        "  Single file:  bun run index.ts --results ./test-output.json\n" +
+        "  Directory:    bun run index.ts --dir ./results/"
     );
   }
 
+  if (resultsPath && dirPath) {
+    fatal("--results and --dir are mutually exclusive. Use one or the other.");
+  }
+
+  const rawConcurrency = get("--concurrency");
+  const concurrency = rawConcurrency ? parseInt(rawConcurrency, 10) : DEFAULT_CONCURRENCY;
+  if (isNaN(concurrency) || concurrency < 1) {
+    fatal("--concurrency must be a positive integer (e.g. --concurrency 4).");
+  }
+
   return {
-    resultsPath: resultsPath as string,
+    resultsPath,
+    dirPath,
+    concurrency,
     reqId: get("--req-id"),
     buildVersion: get("--build"),
     executionStatus: get("--status"),
@@ -176,7 +197,198 @@ interface IngestPayload {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Core logic
+// Concurrency pool
+// Zero-dependency async pool: processes `tasks` with at most `limit`
+// running simultaneously. Does NOT throw — each task must handle its own
+// errors and return a settled result for the caller to inspect.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function asyncPool<T>(
+  limit: number,
+  tasks: (() => Promise<T>)[]
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  const executing = new Set<Promise<void>>();
+
+  for (let i = 0; i < tasks.length; i++) {
+    const idx = i; // capture for closure
+    const p = tasks[idx]().then((res) => {
+      results[idx] = res;
+    });
+
+    const managed = p.finally(() => executing.delete(managed));
+    executing.add(managed);
+
+    if (executing.size >= limit) {
+      // Wait for the fastest in-flight task to finish before queuing the next.
+      await Promise.race(executing);
+    }
+  }
+
+  // Drain any remaining in-flight tasks.
+  await Promise.all(executing);
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON file reader (shared between single and bulk modes)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function readJsonFile(filePath: string): unknown {
+  const rawBytes = readFileSync(filePath);
+  let jsonText: string;
+
+  // Detect and strip BOMs — PowerShell's `echo`/`>` writes UTF-16 LE by
+  // default (FF FE), which causes JSON.parse to throw "Unrecognized token ''".
+  if (rawBytes[0] === 0xff && rawBytes[1] === 0xfe) {
+    jsonText = rawBytes.slice(2).toString("utf16le");
+  } else if (rawBytes[0] === 0xfe && rawBytes[1] === 0xff) {
+    const swapped = Buffer.allocUnsafe(rawBytes.length - 2);
+    for (let i = 0; i < swapped.length; i += 2) {
+      swapped[i] = rawBytes[i + 3];
+      swapped[i + 1] = rawBytes[i + 2];
+    }
+    jsonText = swapped.toString("utf16le");
+  } else if (rawBytes[0] === 0xef && rawBytes[1] === 0xbb && rawBytes[2] === 0xbf) {
+    jsonText = rawBytes.slice(3).toString("utf8");
+  } else {
+    jsonText = rawBytes.toString("utf8");
+  }
+
+  return JSON.parse(jsonText);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bulk directory mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface FileResult {
+  file: string;
+  status: "success" | "failure";
+  detail: string;
+}
+
+async function runBulk(
+  dirPath: string,
+  endpoint: string,
+  apiKey: string,
+  args: CliArgs
+): Promise<void> {
+  const absDir = resolve(dirPath);
+  if (!existsSync(absDir) || !statSync(absDir).isDirectory()) {
+    fatal(`Directory not found or is not a directory: ${absDir}`);
+  }
+
+  // Collect all *.json files (non-recursive, top-level only)
+  const jsonFiles = readdirSync(absDir)
+    .filter((f) => f.toLowerCase().endsWith(".json"))
+    .map((f) => resolve(absDir, f));
+
+  if (jsonFiles.length === 0) {
+    fatal(`No .json files found in: ${absDir}`);
+  }
+
+  const total = jsonFiles.length;
+  const concurrency = args.concurrency;
+
+  console.log("");
+  console.log(chalk.cyan("━━━ Omnis RegOps — Bulk Evidence Ingestion ━━━"));
+  console.log(chalk.dim(`  Directory   : ${absDir}`));
+  console.log(chalk.dim(`  Files found : ${total}`));
+  console.log(chalk.dim(`  Concurrency : ${concurrency} simultaneous uploads`));
+  console.log(chalk.dim(`  Endpoint    : ${endpoint}`));
+  console.log(chalk.dim(`  Key         : ${apiKey.slice(0, 8)}${"*".repeat(apiKey.length - 8)}`));
+  if (args.reqId) console.log(chalk.dim(`  Req ID      : ${args.reqId}`));
+  if (args.buildVersion) console.log(chalk.dim(`  Build       : ${args.buildVersion}`));
+  console.log("");
+
+  // Shared counter for progress display — updated atomically since JS is
+  // single-threaded; no mutex needed.
+  let completed = 0;
+
+  const tasks = jsonFiles.map((filePath): (() => Promise<FileResult>) => {
+    return async (): Promise<FileResult> => {
+      const fileName = basename(filePath);
+
+      // --- Parse ---
+      let results: unknown;
+      try {
+        results = readJsonFile(filePath);
+      } catch (err) {
+        completed++;
+        const msg = `JSON parse error: ${String(err)}`;
+        console.log(
+          chalk.red(`  [${completed}/${total}]`) +
+            chalk.dim(` ${fileName}`) +
+            chalk.red(` ✖  ${msg}`)
+        );
+        return { file: fileName, status: "failure", detail: msg };
+      }
+
+      // --- Build payload ---
+      const payload: IngestPayload = {
+        results,
+        ...(args.buildVersion && { build_version: args.buildVersion }),
+        ...(args.reqId && { req_id: args.reqId }),
+        ...(args.executionStatus && { execution_status: args.executionStatus }),
+      };
+
+      // --- Transmit ---
+      try {
+        const detail = await transmitOne(endpoint, apiKey, payload);
+        completed++;
+        console.log(
+          chalk.green(`  [${completed}/${total}]`) +
+            chalk.dim(` ${fileName}`) +
+            chalk.green(` ✔  ${detail}`)
+        );
+        return { file: fileName, status: "success", detail };
+      } catch (err) {
+        completed++;
+        const msg = String(err);
+        console.log(
+          chalk.red(`  [${completed}/${total}]`) +
+            chalk.dim(` ${fileName}`) +
+            chalk.red(` ✖  ${msg}`)
+        );
+        return { file: fileName, status: "failure", detail: msg };
+      }
+    };
+  });
+
+  // Run with concurrency cap
+  const fileResults = await asyncPool<FileResult>(concurrency, tasks);
+
+  // ─── Summary table ─────────────────────────────────────────────────────────
+  const successes = fileResults.filter((r) => r.status === "success");
+  const failures = fileResults.filter((r) => r.status === "failure");
+
+  console.log("");
+  console.log(chalk.cyan("━━━ Ingestion Summary ━━━"));
+  console.log(
+    chalk.green(`  ✔  Successfully ingested : ${successes.length}`) +
+      chalk.dim(` / ${total}`)
+  );
+
+  if (failures.length > 0) {
+    console.log(chalk.red(`  ✖  Failed                : ${failures.length}`) + chalk.dim(` / ${total}`));
+    console.log("");
+    console.log(chalk.bold("  Failed files:"));
+    for (const f of failures) {
+      console.log(chalk.red(`    • ${f.file}`) + chalk.dim(` — ${f.detail}`));
+    }
+    console.log("");
+    // Exit non-zero so CI/CD pipelines can detect partial failure
+    process.exit(1);
+  } else {
+    console.log("");
+    console.log(chalk.green("  All files ingested successfully."));
+    console.log("");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core logic — single file mode
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function run(): Promise<void> {
@@ -207,39 +419,21 @@ async function run(): Promise<void> {
     process.env.OMNIS_API_ENDPOINT ??
     DEFAULT_ENDPOINT;
 
-  // 4. Read and parse the results file
-  const resultsAbs = resolve(args.resultsPath);
+  // ── Branch: bulk directory mode ──────────────────────────────────────────
+  if (args.dirPath) {
+    await runBulk(args.dirPath, endpoint, apiKey!, args);
+    return;
+  }
+
+  // ── Branch: single file mode ─────────────────────────────────────────────
+  const resultsAbs = resolve(args.resultsPath!);
   if (!existsSync(resultsAbs)) {
     fatal(`Results file not found: ${resultsAbs}`);
   }
 
   let results: unknown;
   try {
-    const rawBytes = readFileSync(resultsAbs);
-    let jsonText: string;
-
-    // Detect and strip BOMs — PowerShell's `echo`/`>` writes UTF-16 LE by
-    // default (FF FE), which causes JSON.parse to throw "Unrecognized token ''".
-    if (rawBytes[0] === 0xff && rawBytes[1] === 0xfe) {
-      // UTF-16 LE: skip the 2-byte BOM, decode the rest as UTF-16 LE.
-      jsonText = rawBytes.slice(2).toString("utf16le");
-    } else if (rawBytes[0] === 0xfe && rawBytes[1] === 0xff) {
-      // UTF-16 BE: swap byte pairs after skipping the 2-byte BOM.
-      const swapped = Buffer.allocUnsafe(rawBytes.length - 2);
-      for (let i = 0; i < swapped.length; i += 2) {
-        swapped[i] = rawBytes[i + 3];
-        swapped[i + 1] = rawBytes[i + 2];
-      }
-      jsonText = swapped.toString("utf16le");
-    } else if (rawBytes[0] === 0xef && rawBytes[1] === 0xbb && rawBytes[2] === 0xbf) {
-      // UTF-8 BOM: skip the 3-byte BOM, rest is plain UTF-8.
-      jsonText = rawBytes.slice(3).toString("utf8");
-    } else {
-      // Plain UTF-8 / ASCII — the normal case.
-      jsonText = rawBytes.toString("utf8");
-    }
-
-    results = JSON.parse(jsonText);
+    results = readJsonFile(resultsAbs);
   } catch (err) {
     fatal(
       `Failed to parse results file as JSON: ${resultsAbs}\n  ${String(err)}\n\n` +
@@ -249,7 +443,7 @@ async function run(): Promise<void> {
     );
   }
 
-  // 5. Build the payload
+  // Build the payload
   const payload: IngestPayload = {
     results,
     ...(args.buildVersion && { build_version: args.buildVersion }),
@@ -257,7 +451,7 @@ async function run(): Promise<void> {
     ...(args.executionStatus && { execution_status: args.executionStatus }),
   };
 
-  // 6. Transmit
+  // Header
   console.log("");
   console.log(chalk.cyan("━━━ Omnis RegOps — Evidence Ingestion ━━━"));
   console.log(chalk.dim(`  Endpoint : ${endpoint}`));
@@ -269,6 +463,63 @@ async function run(): Promise<void> {
 
   await transmit(endpoint, apiKey!, payload);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// transmitOne — returns a short success string or THROWS on error.
+// Used by bulk mode so it can catch per-file errors without crashing the pool.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function transmitOne(
+  endpoint: string,
+  apiKey: string,
+  payload: IngestPayload
+): Promise<string> {
+  let response: Response;
+
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        "User-Agent": "omnis-cli/1.0.0",
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    throw new Error(`Network error — ${String(err)}`);
+  }
+
+  let body: unknown;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    try {
+      body = await response.json();
+    } catch {
+      body = { raw: await response.text() };
+    }
+  } else {
+    body = { raw: await response.text() };
+  }
+
+  if (response.status === 200 || response.status === 201) {
+    const data = body as Record<string, unknown>;
+    const logId = data.log_id ? `log_id=${data.log_id}` : `HTTP ${response.status}`;
+    return logId;
+  }
+
+  const data = body as Record<string, unknown>;
+  const detail =
+    (data?.detail as string) ??
+    (data?.error as string) ??
+    JSON.stringify(body, null, 2);
+
+  throw new Error(`HTTP ${response.status} — ${detail}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// transmit — single-file mode, uses process.exit on failure (original behaviour)
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function transmit(
   endpoint: string,
@@ -387,27 +638,33 @@ function printHelp(): void {
 ${chalk.cyan("omnis-cli")} — Ship signed test evidence to the Omnis RegOps platform.
 
 ${chalk.bold("USAGE")}
-  bun run index.ts --results <path> [options]
+  bun run index.ts --results <path>  [options]   # single file
+  bun run index.ts --dir    <path>   [options]   # entire directory
 
 ${chalk.bold("OPTIONS")}
-  --results   <path>  Path to a JSON file with test results      (required)
-  --req-id    <id>    Regulatory rule ID, e.g. "FDA-820.30g"     (optional)
-  --build     <ver>   Build/version string, e.g. "v1.2.3"        (optional)
-  --status    <val>   Execution status: PASS or FAIL              (optional, default: PASS)
-  --endpoint  <url>   Override the default Vercel endpoint        (optional)
-  --env-file  <path>  Path to a .env file                        (optional, default: ./.env)
-  --help              Show this help text and exit
+  --results     <path>  Path to a single JSON results file             (required if no --dir)
+  --dir         <path>  Path to a directory of JSON results files      (required if no --results)
+  --concurrency <n>     Max simultaneous uploads for --dir             (default: 4)
+  --req-id      <id>    Regulatory rule ID, e.g. "FDA-820.30g"        (optional)
+  --build       <ver>   Build/version string, e.g. "v1.2.3"           (optional)
+  --status      <val>   Execution status: PASS or FAIL                 (optional, default: PASS)
+  --endpoint    <url>   Override the default Vercel endpoint           (optional)
+  --env-file    <path>  Path to a .env file                           (optional, default: ./.env)
+  --help               Show this help text and exit
 
 ${chalk.bold("ENVIRONMENT VARIABLES")}
-  OMNIS_API_KEY       Your org API key (must start with "omn_")  (required)
-  OMNIS_API_ENDPOINT  Override the target endpoint               (optional)
+  OMNIS_API_KEY       Your org API key (must start with "omn_")       (required)
+  OMNIS_API_ENDPOINT  Override the target endpoint                    (optional)
 
 ${chalk.bold("EXAMPLES")}
-  # Basic ingestion
+  # Single file ingestion
   bun run index.ts --results ./test-output.json
 
-  # With regulatory tagging
-  bun run index.ts --results ./test-output.json --req-id "FDA-820.30g" --build "v1.2.3"
+  # Bulk directory ingestion (max 4 concurrent)
+  bun run index.ts --dir ./results/ --build "v1.2.3" --req-id "FDA-820.30g"
+
+  # Bulk with custom concurrency
+  bun run index.ts --dir ./results/ --concurrency 3
 
   # CI/CD with a custom .env path
   bun run index.ts --results ./results/pytest.json --env-file /secrets/.env.omnis
