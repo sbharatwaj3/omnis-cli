@@ -5,15 +5,20 @@
  * Sends local test evidence to the Omnis RegOps platform.
  *
  * USAGE
- *   bun run index.ts --results ./test-output.json [options]
- *   bun run index.ts --dir    ./results/          [options]
+ *   omnis-run ./test-output.json              # single file (positional)
+ *   omnis-run --results ./test-output.json    # single file (named flag)
+ *   omnis-run --dir    ./results/             # entire directory
+ *
+ * Regulatory requirement IDs and build versions are read directly from the
+ * test output JSON — they must be injected by your testing framework via
+ * code annotations (e.g. @pytest.mark.req / // @req Jest comments).
+ * You no longer need to pass --req-id or --build on the command line.
  *
  * OPTIONS
+ *   <path>        (positional)  Path to a single JSON results file        (required if no flags)
  *   --results    <path>   Path to a single JSON results file               (required if no --dir)
  *   --dir        <path>   Path to a directory of JSON results files        (required if no --results)
  *   --concurrency <n>     Max simultaneous uploads when using --dir        (default: 4)
- *   --req-id     <id>     Regulatory rule ID, e.g. "FDA-820.30g"           (optional)
- *   --build      <ver>    Build/version string, e.g. "v1.2.3"              (optional)
  *   --status     <val>    Execution status override: PASS | FAIL            (optional)
  *   --endpoint   <url>    Override the default Vercel endpoint              (optional)
  *   --env-file   <path>   Path to a .env file to load (default: ./.env)    (optional)
@@ -132,8 +137,6 @@ interface CliArgs {
   resultsPath: string | undefined;
   dirPath: string | undefined;
   concurrency: number;
-  reqId: string | undefined;
-  buildVersion: string | undefined;
   executionStatus: string | undefined;
   endpointOverride: string | undefined;
   envFile: string;
@@ -152,14 +155,34 @@ function parseArgs(argv: string[]): CliArgs {
     return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : undefined;
   };
 
-  const resultsPath = get("--results");
+  let resultsPath = get("--results");
   const dirPath = get("--dir");
+
+  // Support bare positional path: omnis-run ./test-output.json
+  // A positional arg is any non-flag token that isn't a value consumed by a known flag.
+  if (!resultsPath && !dirPath) {
+    const knownFlagsThatConsumeValue = new Set([
+      "--results", "--dir", "--concurrency", "--status", "--endpoint", "--env-file",
+    ]);
+    for (let i = 0; i < args.length; i++) {
+      const token = args[i];
+      if (knownFlagsThatConsumeValue.has(token)) {
+        i++; // skip the consumed value
+        continue;
+      }
+      if (!token.startsWith("--")) {
+        // First bare token is treated as the results path
+        resultsPath = token;
+        break;
+      }
+    }
+  }
 
   if (!resultsPath && !dirPath) {
     fatal(
-      "Either --results or --dir is required.\n" +
-        "  Single file:  bun run index.ts --results ./test-output.json\n" +
-        "  Directory:    bun run index.ts --dir ./results/"
+      "Provide a path to your test output file.\n" +
+        "  Single file:  omnis-run ./test-output.json\n" +
+        "  Directory:    omnis-run --dir ./results/"
     );
   }
 
@@ -177,8 +200,6 @@ function parseArgs(argv: string[]): CliArgs {
     resultsPath,
     dirPath,
     concurrency,
-    reqId: get("--req-id"),
-    buildVersion: get("--build"),
     executionStatus: get("--status"),
     endpointOverride: get("--endpoint"),
     envFile: get("--env-file") ?? ".env",
@@ -187,12 +208,13 @@ function parseArgs(argv: string[]): CliArgs {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Payload type (matches IngestPayload in omnis-ui/app/api/ingest/route.ts)
+// req_id and build_version are no longer passed as CLI flags — they are
+// injected into the test output JSON by the testing framework via code
+// annotations (e.g. @pytest.mark.req / // @req Jest comments).
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface IngestPayload {
   results: unknown;
-  build_version?: string;
-  req_id?: string;
   execution_status?: string;
 }
 
@@ -298,8 +320,6 @@ async function runBulk(
   console.log(chalk.dim(`  Concurrency : ${concurrency} simultaneous uploads`));
   console.log(chalk.dim(`  Endpoint    : ${endpoint}`));
   console.log(chalk.dim(`  Key         : ${apiKey.slice(0, 8)}${"*".repeat(apiKey.length - 8)}`));
-  if (args.reqId) console.log(chalk.dim(`  Req ID      : ${args.reqId}`));
-  if (args.buildVersion) console.log(chalk.dim(`  Build       : ${args.buildVersion}`));
   console.log("");
 
   // Shared counter for progress display — updated atomically since JS is
@@ -328,8 +348,6 @@ async function runBulk(
       // --- Build payload ---
       const payload: IngestPayload = {
         results,
-        ...(args.buildVersion && { build_version: args.buildVersion }),
-        ...(args.reqId && { req_id: args.reqId }),
         ...(args.executionStatus && { execution_status: args.executionStatus }),
       };
 
@@ -446,8 +464,6 @@ async function run(): Promise<void> {
   // Build the payload
   const payload: IngestPayload = {
     results,
-    ...(args.buildVersion && { build_version: args.buildVersion }),
-    ...(args.reqId && { req_id: args.reqId }),
     ...(args.executionStatus && { execution_status: args.executionStatus }),
   };
 
@@ -456,8 +472,6 @@ async function run(): Promise<void> {
   console.log(chalk.cyan("━━━ Omnis RegOps — Evidence Ingestion ━━━"));
   console.log(chalk.dim(`  Endpoint : ${endpoint}`));
   console.log(chalk.dim(`  Results  : ${resultsAbs}`));
-  if (args.reqId) console.log(chalk.dim(`  Req ID   : ${args.reqId}`));
-  if (args.buildVersion) console.log(chalk.dim(`  Build    : ${args.buildVersion}`));
   console.log(chalk.dim(`  Key      : ${apiKey!.slice(0, 8)}${"*".repeat(apiKey!.length - 8)}`));
   console.log("");
 
@@ -638,36 +652,47 @@ function printHelp(): void {
 ${chalk.cyan("omnis-cli")} — Ship signed test evidence to the Omnis RegOps platform.
 
 ${chalk.bold("USAGE")}
-  bun run index.ts --results <path>  [options]   # single file
-  bun run index.ts --dir    <path>   [options]   # entire directory
+  omnis-run <path>                   # single file (positional)
+  omnis-run --results <path>         # single file (named flag)
+  omnis-run --dir    <path>          # entire directory
+
+Regulatory requirement IDs and build versions are read directly from the
+test output JSON. Tag your tests with code annotations before running:
+
+  ${chalk.dim("# Python (PyTest)")}
+  @pytest.mark.req("21_CFR_820_30")
+  def test_database_encryption(): ...
+
+  ${chalk.dim("// JavaScript (Jest)")}
+  // @req: IEC_62304_5_1
+  test('authenticates user session', () => { ... });
 
 ${chalk.bold("OPTIONS")}
-  --results     <path>  Path to a single JSON results file             (required if no --dir)
-  --dir         <path>  Path to a directory of JSON results files      (required if no --results)
-  --concurrency <n>     Max simultaneous uploads for --dir             (default: 4)
-  --req-id      <id>    Regulatory rule ID, e.g. "FDA-820.30g"        (optional)
-  --build       <ver>   Build/version string, e.g. "v1.2.3"           (optional)
-  --status      <val>   Execution status: PASS or FAIL                 (optional, default: PASS)
-  --endpoint    <url>   Override the default Vercel endpoint           (optional)
-  --env-file    <path>  Path to a .env file                           (optional, default: ./.env)
-  --help               Show this help text and exit
+  <path>            Path to a single JSON results file                (required if no flags)
+  --results <path>  Path to a single JSON results file                (required if no --dir)
+  --dir     <path>  Path to a directory of JSON results files         (required if no --results)
+  --concurrency <n> Max simultaneous uploads for --dir                (default: 4)
+  --status  <val>   Execution status: PASS or FAIL                    (optional, default: PASS)
+  --endpoint <url>  Override the default Vercel endpoint              (optional)
+  --env-file <path> Path to a .env file                              (optional, default: ./.env)
+  --help            Show this help text and exit
 
 ${chalk.bold("ENVIRONMENT VARIABLES")}
   OMNIS_API_KEY       Your org API key (must start with "omn_")       (required)
   OMNIS_API_ENDPOINT  Override the target endpoint                    (optional)
 
 ${chalk.bold("EXAMPLES")}
-  # Single file ingestion
-  bun run index.ts --results ./test-output.json
+  # Simplest form — just point at the output file
+  omnis-run ./test-output.json
 
   # Bulk directory ingestion (max 4 concurrent)
-  bun run index.ts --dir ./results/ --build "v1.2.3" --req-id "FDA-820.30g"
+  omnis-run --dir ./results/
 
   # Bulk with custom concurrency
-  bun run index.ts --dir ./results/ --concurrency 3
+  omnis-run --dir ./results/ --concurrency 3
 
   # CI/CD with a custom .env path
-  bun run index.ts --results ./results/pytest.json --env-file /secrets/.env.omnis
+  omnis-run ./results/pytest.json --env-file /secrets/.env.omnis
 
 ${chalk.bold("API KEY FORMAT")}
   Keys look like:  omn_a1b2c3d4e5f6...
