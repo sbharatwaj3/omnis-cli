@@ -41,6 +41,7 @@
 
 import { readFileSync, existsSync, readdirSync, statSync } from "fs";
 import { resolve, basename } from "path";
+import { spawnSync } from "child_process";
 import chalk from "chalk";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,6 +131,70 @@ function loadEnvFile(filePath: string): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Developer identity resolution
+//
+// Priority chain (highest → lowest):
+//   1. OMNIS_DEVELOPER_EMAIL env var  — explicit override for CI/CD pipelines
+//      that have no git config (e.g., Docker build containers, GitHub Actions
+//      with a service account). Set this in your pipeline secrets.
+//   2. git config user.email         — local repo config (most specific)
+//   3. git config --global user.email — global git config
+//   4. System user account            — USERNAME (Windows) / USER (Unix/macOS)
+//   5. "unknown_developer"            — final safe fallback; never crashes.
+//
+// CONSTITUTION LAW V: This function NEVER throws. A missing email is not a
+// fatal condition — we degrade gracefully and continue uploading evidence.
+// The developer_email field is nullable in the schema by design.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function resolveDeveloperEmail(): string {
+  // 1. Explicit env var override — useful for CI/CD and Docker environments.
+  const envOverride = process.env.OMNIS_DEVELOPER_EMAIL?.trim();
+  if (envOverride) {
+    return envOverride;
+  }
+
+  // Helper: run `git config <key>` and return the trimmed output, or null.
+  function tryGitConfig(scope: string[]): string | null {
+    try {
+      const result = spawnSync("git", [...scope, "user.email"], {
+        encoding: "utf8",
+        timeout: 3000, // 3 s hard cap — never block the upload for git
+        windowsHide: true,
+      });
+      // exit code 1 means the key is not set; non-zero for other failures
+      if (result.status === 0 && result.stdout) {
+        const email = result.stdout.trim();
+        if (email) return email;
+      }
+    } catch {
+      // spawnSync itself threw (e.g., git not on PATH) — swallow and continue
+    }
+    return null;
+  }
+
+  // 2. Local repo git config
+  const localEmail = tryGitConfig(["config"]);
+  if (localEmail) return localEmail;
+
+  // 3. Global git config (catches machines where the local repo has no user set)
+  const globalEmail = tryGitConfig(["config", "--global"]);
+  if (globalEmail) return globalEmail;
+
+  // 4. System user account — not an email address, but better than nothing
+  //    for audit trail purposes.
+  const systemUser =
+    process.env.USERNAME?.trim() ||   // Windows
+    process.env.USER?.trim();          // Unix / macOS
+  if (systemUser) {
+    return systemUser;
+  }
+
+  // 5. Final safe fallback
+  return "unknown_developer";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Argument parser
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -216,6 +281,10 @@ function parseArgs(argv: string[]): CliArgs {
 interface IngestPayload {
   results: unknown;
   execution_status?: string;
+  /** Developer identity captured from git config user.email at run time.
+   *  Nullable — CI/CD pipelines that cannot resolve an identity send null.
+   *  Matches the developer_email column in evidence_logs (nullable TEXT). */
+  developer_email?: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -294,7 +363,8 @@ async function runBulk(
   dirPath: string,
   endpoint: string,
   apiKey: string,
-  args: CliArgs
+  args: CliArgs,
+  developerEmail: string,
 ): Promise<void> {
   const absDir = resolve(dirPath);
   if (!existsSync(absDir) || !statSync(absDir).isDirectory()) {
@@ -319,6 +389,7 @@ async function runBulk(
   console.log(chalk.dim(`  Files found : ${total}`));
   console.log(chalk.dim(`  Concurrency : ${concurrency} simultaneous uploads`));
   console.log(chalk.dim(`  Endpoint    : ${endpoint}`));
+  console.log(chalk.dim(`  Developer   : ${developerEmail}`));
   console.log(chalk.dim(`  Key         : ${apiKey.slice(0, 8)}${"*".repeat(apiKey.length - 8)}`));
   console.log("");
 
@@ -348,6 +419,7 @@ async function runBulk(
       // --- Build payload ---
       const payload: IngestPayload = {
         results,
+        developer_email: developerEmail,
         ...(args.executionStatus && { execution_status: args.executionStatus }),
       };
 
@@ -415,7 +487,13 @@ async function run(): Promise<void> {
   // 1. Load .env (system env always wins — safe for CI/CD)
   loadEnvFile(args.envFile);
 
-  // 2. Read the API key — CONSTITUTION LAW II: never hardcoded
+  // 2. Resolve developer identity BEFORE reading secrets.
+  //    Runs git config user.email with a 3 s timeout; degrades gracefully
+  //    to system user or "unknown_developer" if git is unavailable.
+  //    CONSTITUTION LAW V: never crashes the CLI — email is informational.
+  const developerEmail = resolveDeveloperEmail();
+
+  // 3. Read the API key — CONSTITUTION LAW II: never hardcoded
   const apiKey = process.env.OMNIS_API_KEY;
   if (!apiKey) {
     fatal(
@@ -431,7 +509,7 @@ async function run(): Promise<void> {
     );
   }
 
-  // 3. Resolve the endpoint (flag > env var > hardcoded default)
+  // 4. Resolve the endpoint (flag > env var > hardcoded default)
   const endpoint =
     args.endpointOverride ??
     process.env.OMNIS_API_ENDPOINT ??
@@ -439,7 +517,7 @@ async function run(): Promise<void> {
 
   // ── Branch: bulk directory mode ──────────────────────────────────────────
   if (args.dirPath) {
-    await runBulk(args.dirPath, endpoint, apiKey!, args);
+    await runBulk(args.dirPath, endpoint, apiKey!, args, developerEmail);
     return;
   }
 
@@ -461,18 +539,20 @@ async function run(): Promise<void> {
     );
   }
 
-  // Build the payload
+  // Build the payload — developer_email always present (nullable in schema)
   const payload: IngestPayload = {
     results,
+    developer_email: developerEmail,
     ...(args.executionStatus && { execution_status: args.executionStatus }),
   };
 
   // Header
   console.log("");
   console.log(chalk.cyan("━━━ Omnis RegOps — Evidence Ingestion ━━━"));
-  console.log(chalk.dim(`  Endpoint : ${endpoint}`));
-  console.log(chalk.dim(`  Results  : ${resultsAbs}`));
-  console.log(chalk.dim(`  Key      : ${apiKey!.slice(0, 8)}${"*".repeat(apiKey!.length - 8)}`));
+  console.log(chalk.dim(`  Endpoint  : ${endpoint}`));
+  console.log(chalk.dim(`  Results   : ${resultsAbs}`));
+  console.log(chalk.dim(`  Developer : ${developerEmail}`));
+  console.log(chalk.dim(`  Key       : ${apiKey!.slice(0, 8)}${"*".repeat(apiKey!.length - 8)}`));
   console.log("");
 
   await transmit(endpoint, apiKey!, payload);
