@@ -131,6 +131,44 @@ function loadEnvFile(filePath: string): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Build check — MUST run before any ingestion path executes.
+//
+// Executes `bun run typecheck` via spawnSync.  Three possible outcomes:
+//   1. Combined output is 0 bytes          → HALT AND CATCH FIRE (ambiguous failure)
+//   2. Non-zero exit code                  → print output, fatal()
+//   3. Exit 0 AND ≥1 byte of output        → return normally, ingestion proceeds
+//
+// CONSTITUTION LAW IV (IEC 62304): fail loudly — never swallow a build failure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @internal */
+export function runBuildCheck(): void {
+  const result = spawnSync("bun", ["run", "typecheck"], {
+    encoding: "utf8",
+    timeout: 60_000,
+    windowsHide: true,
+  });
+
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+
+  if (combined.length === 0) {
+    // HALT AND CATCH FIRE
+    fatal(
+      "Build check produced zero bytes of output (ambiguous failure).\n" +
+      "  Cannot verify type safety. Ingestion aborted per HALT AND CATCH FIRE protocol."
+    );
+  }
+
+  if (result.status !== 0) {
+    console.error(chalk.red("\n[omnis] Build check failed:"));
+    console.error(combined);
+    fatal("Type check failed — fix all errors before ingesting evidence.");
+  }
+
+  console.log(chalk.dim("[omnis] Build check passed."));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Developer identity resolution
 //
 // Priority chain (highest → lowest):
@@ -195,19 +233,137 @@ function resolveDeveloperEmail(): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Git commit hash resolution
+//
+// Executes `git rev-parse HEAD` via spawnSync with a 3 s timeout.
+// On success (exit 0, non-empty stdout): returns the trimmed SHA-1 string.
+// On any failure, empty output, or thrown error: logs a dim notice and
+// returns "unknown_commit". This function NEVER throws.
+//
+// CONSTITUTION LAW V: A missing commit hash is not a fatal condition.
+// The git_commit_hash field is carried on every IngestPayload for audit
+// traceability, but the upload must not be blocked if git is unavailable
+// (e.g., CI/CD containers with no git history, detached HEAD states).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @internal */
+export function resolveGitCommitHash(): string {
+  try {
+    const result = spawnSync("git", ["rev-parse", "HEAD"], {
+      encoding: "utf8",
+      timeout: 3_000,
+      windowsHide: true,
+    });
+    if (result.status === 0 && result.stdout) {
+      const hash = result.stdout.trim();
+      if (hash) return hash;
+    }
+    console.log(chalk.dim(
+      "[omnis] git rev-parse HEAD failed or returned empty — using 'unknown_commit'."
+    ));
+  } catch {
+    console.log(chalk.dim(
+      "[omnis] git rev-parse HEAD threw — using 'unknown_commit'."
+    ));
+  }
+  return "unknown_commit";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Marker extraction — pure helper, no I/O, exported for testing (Properties 7–9)
+//
+// Applies the appropriate regex for the given file extension and returns
+// every captured Req_ID as an array. The regex lastIndex is always reset
+// before the loop so the function is safe to call repeatedly across files.
+//
+// Patterns:
+//   .py  — @pytest.mark.requirement("REQ_ID") or @pytest.mark.requirement('REQ_ID')
+//   .ts/.js — // @req: REQ_ID  (first non-whitespace token after the colon)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @internal */
+export function extractMarkersFromContent(content: string, ext: string): string[] {
+  const PY_RE  = /@pytest\.mark\.requirement\(\s*["']([^"']+)["']\s*\)/g;
+  const REQ_RE = /\/\/\s*@req:\s*(\S+)/g;
+
+  const re = ext === "py" ? PY_RE : REQ_RE;
+  re.lastIndex = 0;
+
+  const found: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    found.push(m[1]);
+  }
+  return found;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Marker scanner — recursively walks srcDir and collects all Req_IDs
+//
+// Requirements 3.1, 3.2, 3.3, 3.4, 3.7, 3.8, 8.3
+//
+// Behaviour:
+//   • Resolves srcDir to an absolute path; calls fatal() if it doesn't exist.
+//   • Recursively traverses with readdirSync({ withFileTypes: true }).
+//   • Visits only .py, .ts, and .js files.
+//   • Delegates extraction to extractMarkersFromContent per file.
+//   • Wraps readFileSync in try/catch — any I/O error calls fatal() with
+//     the path and OS error message (Req 8.3 / Property 16).
+//   • Returns a deduplicated array via Set<string>.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @internal */
+export function scanForMarkers(srcDir: string): string[] {
+  const absDir = resolve(srcDir);
+  if (!existsSync(absDir)) {
+    fatal(`Source directory not found: ${absDir}`);
+  }
+
+  const found = new Set<string>();
+
+  function walk(dir: string): void {
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = resolve(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+      } else if (entry.isFile()) {
+        const ext = entry.name.split(".").pop()?.toLowerCase();
+        if (!ext || !["py", "ts", "js"].includes(ext)) continue;
+        try {
+          const content = readFileSync(fullPath, "utf8");
+          const markers = extractMarkersFromContent(content, ext);
+          for (const m of markers) found.add(m);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          fatal(`File I/O error reading ${fullPath}: ${msg}`);
+        }
+      }
+    }
+  }
+
+  walk(absDir);
+  return Array.from(found);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Argument parser
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface CliArgs {
+/** @internal */
+export interface CliArgs {
   resultsPath: string | undefined;
   dirPath: string | undefined;
+  /** Source directory to scan for requirement markers. Defaults to ".". */
+  srcDir: string;
   concurrency: number;
   executionStatus: string | undefined;
   endpointOverride: string | undefined;
   envFile: string;
 }
 
-function parseArgs(argv: string[]): CliArgs {
+/** @internal */
+export function parseArgs(argv: string[]): CliArgs {
   const args = argv.slice(2); // strip "bun" and "index.ts"
 
   if (args.includes("--help") || args.includes("-h")) {
@@ -227,7 +383,7 @@ function parseArgs(argv: string[]): CliArgs {
   // A positional arg is any non-flag token that isn't a value consumed by a known flag.
   if (!resultsPath && !dirPath) {
     const knownFlagsThatConsumeValue = new Set([
-      "--results", "--dir", "--concurrency", "--status", "--endpoint", "--env-file",
+      "--results", "--dir", "--concurrency", "--status", "--endpoint", "--env-file", "--src-dir",
     ]);
     for (let i = 0; i < args.length; i++) {
       const token = args[i];
@@ -243,13 +399,8 @@ function parseArgs(argv: string[]): CliArgs {
     }
   }
 
-  if (!resultsPath && !dirPath) {
-    fatal(
-      "Provide a path to your test output file.\n" +
-        "  Single file:  omnis-run ./test-output.json\n" +
-        "  Directory:    omnis-run --dir ./results/"
-    );
-  }
+  // No fatal() here — hierarchy mode proceeds when neither --results nor --dir is supplied.
+  // (Req 3.1, 5.1: marker scan and Bedrock fallback activate when no explicit path is given.)
 
   if (resultsPath && dirPath) {
     fatal("--results and --dir are mutually exclusive. Use one or the other.");
@@ -264,6 +415,7 @@ function parseArgs(argv: string[]): CliArgs {
   return {
     resultsPath,
     dirPath,
+    srcDir: get("--src-dir") ?? ".",
     concurrency,
     executionStatus: get("--status"),
     endpointOverride: get("--endpoint"),
@@ -278,13 +430,16 @@ function parseArgs(argv: string[]): CliArgs {
 // annotations (e.g. @pytest.mark.req / // @req Jest comments).
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface IngestPayload {
+/** @internal */
+export interface IngestPayload {
   results: unknown;
   execution_status?: string;
   /** Developer identity captured from git config user.email at run time.
    *  Nullable — CI/CD pipelines that cannot resolve an identity send null.
    *  Matches the developer_email column in evidence_logs (nullable TEXT). */
   developer_email?: string | null;
+  /** SHA-1 commit hash from `git rev-parse HEAD`. Set to "unknown_commit" on failure. */
+  git_commit_hash: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,12 +514,14 @@ interface FileResult {
   detail: string;
 }
 
-async function runBulk(
+/** @internal */
+export async function runBulk(
   dirPath: string,
   endpoint: string,
   apiKey: string,
   args: CliArgs,
   developerEmail: string,
+  gitCommitHash: string,
 ): Promise<void> {
   const absDir = resolve(dirPath);
   if (!existsSync(absDir) || !statSync(absDir).isDirectory()) {
@@ -420,6 +577,7 @@ async function runBulk(
       const payload: IngestPayload = {
         results,
         developer_email: developerEmail,
+        git_commit_hash: gitCommitHash,
         ...(args.executionStatus && { execution_status: args.executionStatus }),
       };
 
@@ -478,7 +636,178 @@ async function runBulk(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Core logic — single file mode
+// Bedrock Auto-Ingest fallback — Priority 2 of the ingestion hierarchy.
+//
+// Activated when the Marker Scanner finds zero annotations in the Source_Tree.
+// Transmits a minimal IngestPayload with execution_status "BEDROCK_AUTO_INGEST"
+// so the API can route it through the Bedrock AI pipeline server-side.
+//
+// Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 8.1
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @internal */
+export async function runBedrockFallback(
+  endpoint: string,
+  apiKey: string,
+  developerEmail: string,
+  gitCommitHash: string,
+): Promise<void> {
+  console.log(chalk.yellow(
+    "[omnis] No requirement markers found. Activating Bedrock Auto-Ingest fallback."
+  ));
+  const payload: IngestPayload = {
+    results: null,
+    execution_status: "BEDROCK_AUTO_INGEST",
+    developer_email: developerEmail,
+    git_commit_hash: gitCommitHash,
+  };
+  await transmit(endpoint, apiKey, payload);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Marker Scan runner — Priority 1 of the ingestion hierarchy.
+//
+// Orchestrates the full Priority 1 path:
+//   1. Call scanForMarkers(srcDir) to find all annotated Req_IDs.
+//   2. If 0 markers found → warn and return false (caller activates Bedrock).
+//   3. Detect test runner(s) from file extensions present in srcDir:
+//        .py files      → python -m pytest
+//        .ts/.js files  → bun test
+//        mixed          → run both sequentially, merge output
+//   4. Capture combined stdout+stderr from each runner via spawnSync.
+//   5. Build IngestPayload with captured output as `results`.
+//   6. Call transmit() — which calls fatal() on any non-2xx / network error.
+//   7. Return true.
+//
+// Requirements: 3.4, 3.5, 3.6, 4.1, 8.1, 8.2
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @internal */
+export async function runMarkerScan(
+  srcDir: string,
+  endpoint: string,
+  apiKey: string,
+  executionStatus: string | undefined,
+  developerEmail: string,
+  gitCommitHash: string,
+): Promise<boolean> {
+  const markers = scanForMarkers(srcDir);
+
+  if (markers.length === 0) {
+    console.warn(chalk.yellow("[omnis] No requirement markers found in source tree."));
+    return false;
+  }
+
+  const absDir = resolve(srcDir);
+
+  // Detect what file types are present in the source tree.
+  // We use a simple recursive scan — no third-party libs required.
+  function hasPyFiles(dir: string): boolean {
+    try {
+      const entries = readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (hasPyFiles(resolve(dir, entry.name))) return true;
+        } else if (entry.isFile() && entry.name.endsWith(".py")) {
+          return true;
+        }
+      }
+    } catch { /* ignore — best-effort scan */ }
+    return false;
+  }
+
+  function hasJsTsFiles(dir: string): boolean {
+    try {
+      const entries = readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (hasJsTsFiles(resolve(dir, entry.name))) return true;
+        } else if (entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
+          return true;
+        }
+      }
+    } catch { /* ignore — best-effort scan */ }
+    return false;
+  }
+
+  const hasPy = hasPyFiles(absDir);
+  const hasJs = hasJsTsFiles(absDir);
+
+  let combinedOutput = "";
+
+  if (hasPy) {
+    const r = spawnSync("python", ["-m", "pytest", absDir], {
+      encoding: "utf8",
+      timeout: 120_000,
+      windowsHide: true,
+    });
+    combinedOutput += (r.stdout ?? "") + (r.stderr ?? "");
+  }
+
+  if (hasJs) {
+    const r = spawnSync("bun", ["test", absDir], {
+      encoding: "utf8",
+      timeout: 120_000,
+      windowsHide: true,
+    });
+    combinedOutput += (r.stdout ?? "") + (r.stderr ?? "");
+  }
+
+  // Edge case: neither extension detected — default to bun test.
+  if (!hasPy && !hasJs) {
+    const r = spawnSync("bun", ["test", absDir], {
+      encoding: "utf8",
+      timeout: 120_000,
+      windowsHide: true,
+    });
+    combinedOutput += (r.stdout ?? "") + (r.stderr ?? "");
+  }
+
+  const payload: IngestPayload = {
+    results: combinedOutput,
+    developer_email: developerEmail,
+    git_commit_hash: gitCommitHash,
+    ...(executionStatus ? { execution_status: executionStatus } : {}),
+  };
+
+  await transmit(endpoint, apiKey, payload);
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API key format validation — exported for Property 13 tests.
+//
+// Validates that the key starts with "omn_" and meets the minimum length.
+// Calls fatal() if either check fails — never returns on bad input.
+//
+// CONSTITUTION LAW V: no auth bypass under any code path.
+// Requirements: 7.2, 7.3
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @internal */
+export function validateApiKey(key: string): void {
+  if (!key.startsWith(API_KEY_PREFIX) || key.length < MIN_API_KEY_LENGTH) {
+    fatal(
+      `OMNIS_API_KEY must start with '${API_KEY_PREFIX}' and be at least ${MIN_API_KEY_LENGTH} characters.\n` +
+        "  You can generate a key in the Omnis dashboard under Settings → API Keys."
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core logic — wires the full ingestion hierarchy.
+//
+// Control flow (Requirements 1.1, 2.5, 5.1, 5.5, 6.2, 7.1, 7.5):
+//   1. parseArgs + loadEnvFile
+//   2. runBuildCheck  ← ALWAYS FIRST before any identity / ingestion logic
+//   3. resolveDeveloperEmail
+//   4. resolveGitCommitHash  ← threaded explicitly, never stored in module scope
+//   5. validateApiKey
+//   6. resolveEndpoint
+//   7. Mode branch:
+//       --dir      → runBulk (bypasses hierarchy)
+//       --results  → single-file ingest (bypasses hierarchy)
+//       neither    → runMarkerScan → runBedrockFallback if !markerHit
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function run(): Promise<void> {
@@ -487,14 +816,22 @@ async function run(): Promise<void> {
   // 1. Load .env (system env always wins — safe for CI/CD)
   loadEnvFile(args.envFile);
 
-  // 2. Resolve developer identity BEFORE reading secrets.
+  // 2. Build gate — MUST execute before any identity resolution or ingestion.
+  //    CONSTITUTION LAW IV / IEC 62304: fail loudly on broken builds.
+  runBuildCheck();
+
+  // 3. Resolve developer identity.
   //    Runs git config user.email with a 3 s timeout; degrades gracefully
   //    to system user or "unknown_developer" if git is unavailable.
   //    CONSTITUTION LAW V: never crashes the CLI — email is informational.
   const developerEmail = resolveDeveloperEmail();
 
-  // 3. Read the API key — CONSTITUTION LAW II: never hardcoded
-  const apiKey = process.env.OMNIS_API_KEY;
+  // 4. Resolve git commit hash — once, threaded explicitly to all paths.
+  //    Never stored in a module-level mutable. Falls back to "unknown_commit".
+  const gitCommitHash = resolveGitCommitHash();
+
+  // 5. Read and validate the API key — CONSTITUTION LAW II: never hardcoded.
+  const apiKey = process.env.OMNIS_API_KEY?.trim();
   if (!apiKey) {
     fatal(
       "OMNIS_API_KEY environment variable is not set.\n" +
@@ -502,60 +839,73 @@ async function run(): Promise<void> {
         "    export OMNIS_API_KEY=omn_<your_key>"
     );
   }
-  if (!apiKey!.startsWith(API_KEY_PREFIX) || apiKey!.length < MIN_API_KEY_LENGTH) {
-    fatal(
-      `OMNIS_API_KEY must start with '${API_KEY_PREFIX}' and be at least ${MIN_API_KEY_LENGTH} characters.\n` +
-        "  You can generate a key in the Omnis dashboard under Settings → API Keys."
-    );
-  }
+  validateApiKey(apiKey!);
 
-  // 4. Resolve the endpoint (flag > env var > hardcoded default)
+  // 6. Resolve the endpoint (flag > env var > hardcoded default)
   const endpoint =
     args.endpointOverride ??
     process.env.OMNIS_API_ENDPOINT ??
     DEFAULT_ENDPOINT;
 
-  // ── Branch: bulk directory mode ──────────────────────────────────────────
+  // ── Branch: bulk directory mode — bypasses hierarchy entirely (Req 6.2) ──
   if (args.dirPath) {
-    await runBulk(args.dirPath, endpoint, apiKey!, args, developerEmail);
+    await runBulk(args.dirPath, endpoint, apiKey!, args, developerEmail, gitCommitHash);
     return;
   }
 
-  // ── Branch: single file mode ─────────────────────────────────────────────
-  const resultsAbs = resolve(args.resultsPath!);
-  if (!existsSync(resultsAbs)) {
-    fatal(`Results file not found: ${resultsAbs}`);
+  // ── Branch: single file mode — bypasses hierarchy entirely (Req 5.1) ─────
+  if (args.resultsPath) {
+    const resultsAbs = resolve(args.resultsPath);
+    if (!existsSync(resultsAbs)) {
+      fatal(`Results file not found: ${resultsAbs}`);
+    }
+
+    let results: unknown;
+    try {
+      results = readJsonFile(resultsAbs);
+    } catch (err) {
+      fatal(
+        `Failed to parse results file as JSON: ${resultsAbs}\n  ${String(err)}\n\n` +
+        "  Tip: If you created this file with PowerShell echo or >, it may be\n" +
+        "  UTF-16 encoded. Re-save it as UTF-8:\n" +
+        "    $data | ConvertTo-Json | Out-File -FilePath test-output.json -Encoding utf8"
+      );
+    }
+
+    // Build the payload — git_commit_hash always populated (Req 5.5, 2.5)
+    const payload: IngestPayload = {
+      results,
+      developer_email: developerEmail,
+      git_commit_hash: gitCommitHash,
+      ...(args.executionStatus && { execution_status: args.executionStatus }),
+    };
+
+    // Header
+    console.log("");
+    console.log(chalk.cyan("━━━ Omnis RegOps — Evidence Ingestion ━━━"));
+    console.log(chalk.dim(`  Endpoint  : ${endpoint}`));
+    console.log(chalk.dim(`  Results   : ${resultsAbs}`));
+    console.log(chalk.dim(`  Developer : ${developerEmail}`));
+    console.log(chalk.dim(`  Commit    : ${gitCommitHash}`));
+    console.log(chalk.dim(`  Key       : ${apiKey!.slice(0, 8)}${"*".repeat(apiKey!.length - 8)}`));
+    console.log("");
+
+    await transmit(endpoint, apiKey!, payload);
+    return;
   }
 
-  let results: unknown;
-  try {
-    results = readJsonFile(resultsAbs);
-  } catch (err) {
-    fatal(
-      `Failed to parse results file as JSON: ${resultsAbs}\n  ${String(err)}\n\n` +
-      "  Tip: If you created this file with PowerShell echo or >, it may be\n" +
-      "  UTF-16 encoded. Re-save it as UTF-8:\n" +
-      "    $data | ConvertTo-Json | Out-File -FilePath test-output.json -Encoding utf8"
-    );
+  // ── Branch: hierarchy mode — Marker Scan → Bedrock fallback (Req 3.1, 4.1) ─
+  const markerHit = await runMarkerScan(
+    args.srcDir,
+    endpoint,
+    apiKey!,
+    args.executionStatus,
+    developerEmail,
+    gitCommitHash,
+  );
+  if (!markerHit) {
+    await runBedrockFallback(endpoint, apiKey!, developerEmail, gitCommitHash);
   }
-
-  // Build the payload — developer_email always present (nullable in schema)
-  const payload: IngestPayload = {
-    results,
-    developer_email: developerEmail,
-    ...(args.executionStatus && { execution_status: args.executionStatus }),
-  };
-
-  // Header
-  console.log("");
-  console.log(chalk.cyan("━━━ Omnis RegOps — Evidence Ingestion ━━━"));
-  console.log(chalk.dim(`  Endpoint  : ${endpoint}`));
-  console.log(chalk.dim(`  Results   : ${resultsAbs}`));
-  console.log(chalk.dim(`  Developer : ${developerEmail}`));
-  console.log(chalk.dim(`  Key       : ${apiKey!.slice(0, 8)}${"*".repeat(apiKey!.length - 8)}`));
-  console.log("");
-
-  await transmit(endpoint, apiKey!, payload);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -732,37 +1082,62 @@ function printHelp(): void {
 ${chalk.cyan("omnis-cli")} — Ship signed test evidence to the Omnis RegOps platform.
 
 ${chalk.bold("USAGE")}
-  omnis-run <path>                   # single file (positional)
-  omnis-run --results <path>         # single file (named flag)
-  omnis-run --dir    <path>          # entire directory
+  omnis-run                          # hierarchy mode (marker scan → Bedrock fallback)
+  omnis-run <path>                   # single file override (positional)
+  omnis-run --results <path>         # single file override (named flag)
+  omnis-run --dir    <path>          # bulk directory override
 
 Regulatory requirement IDs and build versions are read directly from the
 test output JSON. Tag your tests with code annotations before running:
 
   ${chalk.dim("# Python (PyTest)")}
-  @pytest.mark.req("21_CFR_820_30")
+  @pytest.mark.requirement("21_CFR_820_30")
   def test_database_encryption(): ...
 
-  ${chalk.dim("// JavaScript (Jest)")}
+  ${chalk.dim("// JavaScript / TypeScript")}
   // @req: IEC_62304_5_1
   test('authenticates user session', () => { ... });
 
 ${chalk.bold("OPTIONS")}
-  <path>            Path to a single JSON results file                (required if no flags)
-  --results <path>  Path to a single JSON results file                (required if no --dir)
-  --dir     <path>  Path to a directory of JSON results files         (required if no --results)
+  <path>            Path to a single JSON results file                (optional — bypasses hierarchy)
+  --results <path>  Path to a single JSON results file                (optional — bypasses hierarchy)
+  --dir     <path>  Path to a directory of JSON results files         (optional — bypasses hierarchy)
+  --src-dir <path>  Directory to scan for requirement markers         (default: ".")
   --concurrency <n> Max simultaneous uploads for --dir                (default: 4)
   --status  <val>   Execution status: PASS or FAIL                    (optional, default: PASS)
   --endpoint <url>  Override the default Vercel endpoint              (optional)
   --env-file <path> Path to a .env file                              (optional, default: ./.env)
   --help            Show this help text and exit
 
+${chalk.bold("MODES")}
+  ${chalk.underline("Hierarchy mode")} (default — no --results or --dir):
+    Priority 1: Marker Scan — Scans --src-dir for @pytest.mark.requirement /
+                // @req: annotations, runs the associated tests, and ingests
+                the results.
+    Priority 2: Bedrock Auto-Ingest — If no annotations are found, activates
+                AI-assisted ingestion via AWS Bedrock (no test output file
+                required).
+
+  ${chalk.underline("--results override")}:
+    Bypasses the hierarchy entirely. Ingests the provided JSON results file
+    directly.
+
+  ${chalk.underline("--dir bulk mode")}:
+    Bypasses the hierarchy entirely. Ingests all .json files in the given
+    directory.
+
 ${chalk.bold("ENVIRONMENT VARIABLES")}
   OMNIS_API_KEY       Your org API key (must start with "omn_")       (required)
   OMNIS_API_ENDPOINT  Override the target endpoint                    (optional)
 
 ${chalk.bold("EXAMPLES")}
-  # Simplest form — just point at the output file
+  # Hierarchy mode — auto-scan current directory for annotations
+  omnis-run
+
+  # Hierarchy mode — scan a specific source directory
+  omnis-run --src-dir ./src
+
+  # Single file override — bypass hierarchy with a pre-built results file
   omnis-run ./test-output.json
 
   # Bulk directory ingestion (max 4 concurrent)
@@ -781,10 +1156,13 @@ ${chalk.bold("API KEY FORMAT")}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Entry point
+// Entry point — only execute when this file is the direct entry point,
+// not when it is imported as a module (e.g. during testing).
 // ─────────────────────────────────────────────────────────────────────────────
 
-run().catch((err: unknown) => {
-  console.error(chalk.red("\n✖  Unhandled error:"), err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  run().catch((err: unknown) => {
+    console.error(chalk.red("\n✖  Unhandled error:"), err);
+    process.exit(1);
+  });
+}
